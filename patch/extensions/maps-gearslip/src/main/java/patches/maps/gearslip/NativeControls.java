@@ -48,7 +48,8 @@ final class NativeControls implements ViewTreeObserver.OnGlobalLayoutListener, V
      * Keep Maps' own map buttons (the settings/sound/compass/report rail and zoom) on the
      * map, as stock Google Maps on Android Auto shows them, instead of moving them into the
      * host's action strips. Those strips pop up over the route and make the host reserve a
-     * margin beside the map. Search and voice outside the map buttons are still exported.
+     * margin beside the map. Maps' search stays native too; voice outside the
+     * map buttons is still exported.
      */
     static boolean nativeMapButtons = true;
     private final ViewGroup root;
@@ -98,7 +99,7 @@ final class NativeControls implements ViewTreeObserver.OnGlobalLayoutListener, V
         String name = name(view);
         mapButtons |= "map_buttons_view_container".equals(name);
         if (name != null && nativeVisibility(view) != View.GONE) for (Role role : Role.values()) {
-            if (nativeMapButtons && (mapButtons || role.map)) continue;
+            if (nativeMapButtons && (mapButtons || role.map || role == Role.SEARCH)) continue;
             boolean matches = false;
             for (String candidate : role.names) if (candidate.equals(name)) { matches = true; break; }
             if (!matches) continue;

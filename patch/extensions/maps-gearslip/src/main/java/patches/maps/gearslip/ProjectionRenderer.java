@@ -69,6 +69,10 @@ public final class ProjectionRenderer {
     private static final boolean FULL_CANVAS = true;
     private long downTime;
     private float touchX, touchY;
+    // Keep one two-finger gesture alive across consecutive host onScale callbacks.
+    private boolean pinchActive;
+    private float pinchRadius, pinchFocusX, pinchFocusY;
+    private final Runnable endPinch = () -> guard(this::finishTouch);
     private final Runnable endScroll = () -> guard(this::finishTouch);
     private final Runnable bindTimeout = () -> fail(new IllegalStateException("Maps' native car service did not connect"));
     private final ServiceConnection connection = new ServiceConnection() {
@@ -333,16 +337,55 @@ public final class ProjectionRenderer {
     }
     public void scale(float focusX, float focusY, float factor) {
         guard(() -> {
-            if (!Float.isFinite(factor) || factor <= 0) return;
-            finishTouch();
-            downTime = SystemClock.uptimeMillis();
-            float radius = Math.min(width, height) / 8f;
-            twoPointers(MotionEvent.ACTION_DOWN, focusX, focusY, radius, 1);
-            twoPointers(MotionEvent.ACTION_POINTER_DOWN | (1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT), focusX, focusY, radius, 2);
-            twoPointers(MotionEvent.ACTION_MOVE, focusX, focusY, radius * factor, 2);
-            twoPointers(MotionEvent.ACTION_POINTER_UP | (1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT), focusX, focusY, radius * factor, 2);
-            twoPointers(MotionEvent.ACTION_UP, focusX, focusY, radius * factor, 1);
-            downTime = 0;
+            float x = focusX, y = focusY;
+            if (!Float.isFinite(factor) || factor <= 0 || width < 80 || height < 80) return;
+            // A per-callback ratio is NOT the total zoom for the gesture.
+            // The previous implementation completed a separate touch gesture on
+            // every callback, so small zoom-in updates were often ignored.
+            if (!Float.isFinite(x) || !Float.isFinite(y)
+                    || x < 0 || x >= width || y < 0 || y >= height) {
+                x = width / 2f;
+                y = height / 2f;
+            }
+            // Keep both synthetic fingers inside the surface.
+            float maxRadius = Math.min(Math.min(x, width - 1f - x),
+                                       Math.min(height, width) / 2f);
+            // If the focus is at the edge, use a safe central focus.
+            if (maxRadius < 32f) {
+                x = width / 2f;
+                y = height / 2f;
+                maxRadius = Math.min(width, height) / 2f - 1f;
+            }
+            float baseRadius = Math.min(Math.min(width, height) / 8f, maxRadius * 0.55f);
+            float nextRadius = pinchActive ? pinchRadius * factor : baseRadius * factor;
+            Log.d("MapsPinch", "factor=" + factor + " radius=" + nextRadius);
+
+            // Rebase when the synthetic fingers would get too close or too far
+            // apart. A fresh gesture still preserves the host's zoom direction.
+            if (pinchActive && (nextRadius < 12f || nextRadius > maxRadius * 0.95f
+                    || Math.abs(x - pinchFocusX) > 40f
+                    || Math.abs(y - pinchFocusY) > 40f)) {
+                finishTouch();
+                nextRadius = baseRadius * factor;
+            }
+            if (!pinchActive) {
+                finishTouch(); // Finish a previous one-finger pan, if present.
+                pinchActive = true;
+                downTime = SystemClock.uptimeMillis();
+                pinchFocusX = x;
+                pinchFocusY = y;
+                pinchRadius = baseRadius;
+                twoPointers(MotionEvent.ACTION_DOWN,
+                        pinchFocusX, pinchFocusY, pinchRadius, 1);
+                twoPointers(MotionEvent.ACTION_POINTER_DOWN
+                                | (1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                        pinchFocusX, pinchFocusY, pinchRadius, 2);
+            }
+            pinchRadius = Math.max(12f, Math.min(maxRadius * 0.95f, nextRadius));
+            twoPointers(MotionEvent.ACTION_MOVE,
+                    pinchFocusX, pinchFocusY, pinchRadius, 2);
+            main.removeCallbacks(endPinch);
+            main.postDelayed(endPinch, 220);
         });
     }
 
@@ -452,7 +495,22 @@ public final class ProjectionRenderer {
     }
     private void finishTouch() throws Exception {
         main.removeCallbacks(endScroll);
-        if (downTime != 0) { touch(MotionEvent.ACTION_UP, touchX, touchY); downTime = 0; }
+        main.removeCallbacks(endPinch);
+        if (pinchActive) {
+            pinchActive = false;
+            try {
+                twoPointers(MotionEvent.ACTION_POINTER_UP
+                                | (1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                        pinchFocusX, pinchFocusY, pinchRadius, 2);
+                twoPointers(MotionEvent.ACTION_UP,
+                        pinchFocusX, pinchFocusY, pinchRadius, 1);
+            } finally {
+                downTime = 0;
+            }
+        } else if (downTime != 0) {
+            try { touch(MotionEvent.ACTION_UP, touchX, touchY); }
+            finally { downTime = 0; }
+        }
     }
     private void touch(int action, float x, float y) throws Exception {
         View view = decor();
