@@ -67,6 +67,12 @@ public final class ProjectionRenderer {
     private java.util.function.BiConsumer<CharSequence,Integer> toast=(text,duration)->{};
     private Rect visibleArea, stableArea, appliedInsets;
     private static final boolean FULL_CANVAS = true;
+    // Pinch calibration. The host reports raw incremental span factors; feeding
+    // them to Maps 1:1 felt nervous and overshooting, and ending the synthetic
+    // gesture on every rebase made Maps settle the zoom back a visible step.
+    private static final float PINCH_GAIN = 0.6f;       // 1 = raw host factor; lower calms the zoom.
+    private static final float PINCH_DEADZONE = 0.01f;  // host jitter below this only holds the gesture.
+    private static final long PINCH_HOLD_MS = 380L;     // keep the pinch alive across host pauses.
     private long downTime;
     private float touchX, touchY;
     // Keep one two-finger gesture alive across consecutive host onScale callbacks.
@@ -286,6 +292,21 @@ public final class ProjectionRenderer {
         value.orientation=w>=h?Configuration.ORIENTATION_LANDSCAPE:Configuration.ORIENTATION_PORTRAIT;
         return value;
     }
+
+    /** Damped host factor: a full finger-spread (x2) becomes ~+0.6 zoom levels instead of +1. */
+    static float dampedPinch(float factor) { return (float) Math.pow(factor, PINCH_GAIN); }
+    /** Host jitter that must not zoom; it still keeps a held gesture alive. */
+    static boolean pinchJitter(float factor) { return Math.abs(factor - 1f) < PINCH_DEADZONE; }
+    /** True when the synthetic pair must rebase: span out of range or the host focus drifted. */
+    static boolean pinchNeedsRebase(float nextRadius, float maxRadius, float focusX, float focusY, float pinchFocusX, float pinchFocusY) {
+        return nextRadius < 12f || nextRadius > maxRadius * 0.95f
+                || Math.abs(focusX - pinchFocusX) > 40f || Math.abs(focusY - pinchFocusY) > 40f;
+    }
+    /** Symmetric radius continuing the re-placed pair: finger0 never moved, finger1 went down at focus+baseRadius. */
+    static float rebaseRadius(float pinchFocusX, float pinchFocusY, float pinchRadius, float focusX, float focusY, float baseRadius) {
+        return (float) Math.hypot((focusX + baseRadius) - (pinchFocusX - pinchRadius), focusY - pinchFocusY) / 2f;
+    }
+
     public void back() {
         guard(() -> {
             finishTouch();
@@ -357,16 +378,32 @@ public final class ProjectionRenderer {
                 maxRadius = Math.min(width, height) / 2f - 1f;
             }
             float baseRadius = Math.min(Math.min(width, height) / 8f, maxRadius * 0.55f);
-            float nextRadius = pinchActive ? pinchRadius * factor : baseRadius * factor;
-            Log.d("MapsPinch", "factor=" + factor + " radius=" + nextRadius);
+            if (pinchActive) {
+                // A still-held pinch must not be finalized because the host paused
+                // or reported jitter; only real movement updates the radius below.
+                main.removeCallbacks(endPinch);
+                main.postDelayed(endPinch, PINCH_HOLD_MS);
+            }
+            if (pinchJitter(factor)) return;
+            float damped = dampedPinch(factor);
+            float nextRadius = pinchActive ? pinchRadius * damped : baseRadius * damped;
+            Log.d("MapsPinch", "factor=" + factor + " damped=" + damped + " radius=" + nextRadius);
 
             // Rebase when the synthetic fingers would get too close or too far
-            // apart. A fresh gesture still preserves the host's zoom direction.
-            if (pinchActive && (nextRadius < 12f || nextRadius > maxRadius * 0.95f
-                    || Math.abs(x - pinchFocusX) > 40f
-                    || Math.abs(y - pinchFocusY) > 40f)) {
-                finishTouch();
-                nextRadius = baseRadius * factor;
+            // apart, or the host focus drifted: lift one finger and re-place it so
+            // Maps restarts its span baseline WITHOUT ending the gesture (ending
+            // it mid-pinch makes Maps visibly settle the zoom back a step).
+            if (pinchActive && pinchNeedsRebase(nextRadius, maxRadius, x, y, pinchFocusX, pinchFocusY)) {
+                twoPointers(MotionEvent.ACTION_POINTER_UP
+                                | (1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                        pinchFocusX - pinchRadius, pinchFocusY, pinchFocusX + pinchRadius, pinchFocusY, 2);
+                twoPointers(MotionEvent.ACTION_POINTER_DOWN
+                                | (1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                        pinchFocusX - pinchRadius, pinchFocusY, x + baseRadius, y, 2);
+                pinchRadius = rebaseRadius(pinchFocusX, pinchFocusY, pinchRadius, x, y, baseRadius);
+                pinchFocusX = x;
+                pinchFocusY = y;
+                nextRadius = pinchRadius * damped;
             }
             if (!pinchActive) {
                 finishTouch(); // Finish a previous one-finger pan, if present.
@@ -385,7 +422,7 @@ public final class ProjectionRenderer {
             twoPointers(MotionEvent.ACTION_MOVE,
                     pinchFocusX, pinchFocusY, pinchRadius, 2);
             main.removeCallbacks(endPinch);
-            main.postDelayed(endPinch, 220);
+            main.postDelayed(endPinch, PINCH_HOLD_MS);
         });
     }
 
@@ -520,13 +557,16 @@ public final class ProjectionRenderer {
         try { view.dispatchTouchEvent(event); } finally { event.recycle(); }
     }
     private void twoPointers(int action, float x, float y, float radius, int count) throws Exception {
+        twoPointers(action, x - radius, y, x + radius, y, count);
+    }
+    private void twoPointers(int action, float x0, float y0, float x1, float y1, int count) throws Exception {
         View view = decor();
         if (view == null) return;
         MotionEvent.PointerProperties[] properties = new MotionEvent.PointerProperties[count];
         MotionEvent.PointerCoords[] coordinates = new MotionEvent.PointerCoords[count];
         for (int i = 0; i < count; i++) {
             properties[i] = new MotionEvent.PointerProperties(); properties[i].id = i; properties[i].toolType = MotionEvent.TOOL_TYPE_FINGER;
-            coordinates[i] = new MotionEvent.PointerCoords(); coordinates[i].x = x + (i == 0 ? -radius : radius); coordinates[i].y = y; coordinates[i].pressure = 1; coordinates[i].size = 1;
+            coordinates[i] = new MotionEvent.PointerCoords(); coordinates[i].x = i == 0 ? x0 : x1; coordinates[i].y = i == 0 ? y0 : y1; coordinates[i].pressure = 1; coordinates[i].size = 1;
         }
         MotionEvent event = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, count, properties, coordinates, 0, 0, 1, 1, 0, 0, 0x1002, 0);
         try { view.dispatchTouchEvent(event); } finally { event.recycle(); }
