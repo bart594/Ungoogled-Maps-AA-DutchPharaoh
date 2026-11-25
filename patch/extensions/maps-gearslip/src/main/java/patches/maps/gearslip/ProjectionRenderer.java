@@ -134,6 +134,13 @@ public final class ProjectionRenderer {
         return controls == null ? Collections.emptyList() : controls.snapshot();
     }
     String controlsTitle() { return controls == null ? "More controls" : controls.moreTitle(); }
+    /** Projected content root for the suggestion watcher; null when the renderer is down. */
+    ViewGroup suggestionRoot() {
+        try {
+            View view = decor();
+            return view instanceof ViewGroup ? (ViewGroup) view : null;
+        } catch (Exception unavailable) { return null; }
+    }
     void performControl(NativeControls.Control control) throws Exception {
         attachControls();
         if (controls == null) throw new SecurityException("Maps controls are unavailable");

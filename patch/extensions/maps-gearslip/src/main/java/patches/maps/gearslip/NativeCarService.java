@@ -17,6 +17,7 @@ import android.os.Parcel;
 import android.os.RemoteException;
 import android.util.Log;
 import android.view.Surface;
+import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import java.security.MessageDigest;
 import java.util.HashMap;
@@ -59,6 +60,8 @@ public final class NativeCarService extends Service {
         IBinder.DeathRecipient death;
         Throwable failure;
         volatile NativeKeyboard keyboard;
+        volatile NativeSuggestions suggestions;
+        String lastQuery;
         boolean controlsOpen;
         Session(int uid, Binding binding) { this.uid = uid; this.binding = binding; this.generation = binding.generation; }
     }
@@ -213,6 +216,7 @@ public final class NativeCarService extends Service {
     private void clearKeyboard(Session session) {
         if (session.keyboard != null) session.keyboard.close();
         session.keyboard = null;
+        if (session.suggestions != null) { session.suggestions.close(); session.suggestions = null; }
     }
 
     private void invalidate(Session session) {
@@ -226,6 +230,15 @@ public final class NativeCarService extends Service {
         try {
             clearKeyboard(session);
             session.keyboard = new NativeKeyboard(input, editor);
+            try {
+                ViewGroup decor = session.renderer == null ? null : session.renderer.suggestionRoot();
+                session.suggestions = decor == null ? null : new NativeSuggestions(decor, () -> {
+                    if (session.keyboard != null) invalidate(session);
+                });
+            } catch (Exception unavailable) {
+                Log.w("MapsNativeCar", "Suggestion rows unavailable; continuing without host list", unavailable);
+                session.suggestions = null;
+            }
             invalidate(session);
         } catch (Exception error) { failed(session, error); }
     }
@@ -420,10 +433,18 @@ public final class NativeCarService extends Service {
                         if (active != session || session.closed) CarProtocol.complete(callback, null, new IllegalStateException("Car session closed"));
                         else if (session.renderer == null && session.failure == null) CarProtocol.complete(callback, null, new IllegalStateException("Car app has not been created"));
                         else {
-                            try {
+                             try {
                                 NativeKeyboard input = session.keyboard;
+                                List<Bundle> rows = new ArrayList<>();
+                                NativeSuggestions watcher = session.suggestions;
+                                if (input != null && watcher != null) {
+                                    for (NativeSuggestions.Entry entry : watcher.snapshot()) {
+                                        rows.add(CarProtocol.suggestionRow(entry.label(), entry.lines(),
+                                                new SuggestionBinder(session, input, watcher, entry)));
+                                    }
+                                }
                                 Bundle template = session.failure != null ? CarProtocol.template(session.failure)
-                                        : input != null ? CarProtocol.searchTemplate(input.text(), input.hint(), new SearchBinder(session, input))
+                                        : input != null ? CarProtocol.searchTemplate(input.text(), input.hint(), new SearchBinder(session, input), rows)
                                         : controlsTemplate(session);
                                 CarProtocol.screenStack(template,session.controlsOpen);
                                 CarProtocol.complete(callback, template, null);
@@ -527,11 +548,48 @@ public final class NativeCarService extends Service {
                 if (session.keyboard != input) throw new SecurityException("Maps input connection replaced");
                 dispatch(session, callback, true, () -> {
                     if (session.keyboard != input) throw new SecurityException("Maps input connection replaced");
-                    if (code == 2) input.replace(query);
+                    if (code == 2) {
+                        input.replace(query);
+                        // A repeated identical query carries no new results; only a changed
+                        // query retires rows so the display does not churn needlessly.
+                        String current = query == null ? "" : query;
+                        if (!current.equals(session.lastQuery)) {
+                            session.lastQuery = current;
+                            if (session.suggestions != null) session.suggestions.queryChanged();
+                        }
+                    }
                     else {
                         input.submit(query);
                         clearKeyboard(session); invalidate(session);
                     }
+                });
+            } catch (Exception error) { CarProtocol.complete(callback, null, error); }
+            return true;
+        }
+    }
+
+    /** Typed suggestion click: the exact native row, revalidated; stale selections never act. */
+    private final class SuggestionBinder extends Binder {
+        private final Session session;
+        private final NativeKeyboard input;
+        private final NativeSuggestions watcher;
+        private final NativeSuggestions.Entry bound;
+        SuggestionBinder(Session session, NativeKeyboard input, NativeSuggestions watcher, NativeSuggestions.Entry bound) {
+            this.session = session; this.input = input; this.watcher = watcher; this.bound = bound;
+            attachInterface(null, "androidx.car.app.model.IOnClickListener");
+        }
+        @Override protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
+            if (CarProtocol.basic("androidx.car.app.model.IOnClickListener", code, data, reply)) return true;
+            if (code != 2) return false;
+            IBinder callback = data.readStrongBinder();
+            try {
+                requireSession(session);
+                // Recycled views rebound to the same label at the same index cannot be
+                // distinguished through public APIs; entries retire on every input edit.
+                dispatch(session, callback, true, () -> {
+                    if (session.keyboard != input) return;
+                    if (session.suggestions == null || session.suggestions != watcher) return;
+                    bound.revalidateAndInvoke();
                 });
             } catch (Exception error) { CarProtocol.complete(callback, null, error); }
             return true;

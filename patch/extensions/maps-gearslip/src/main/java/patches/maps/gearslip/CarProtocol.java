@@ -126,6 +126,18 @@ final class CarProtocol {
         return row;
     }
 
+    static Bundle suggestionRow(String title, List<String> lines, IBinder callback) {
+        Bundle row = object("androidx.car.app.model.Row");
+        field(row, "mTitle", text(title));
+        List<Bundle> texts = new ArrayList<>();
+        for (String line : lines) texts.add(text(line));
+        field(row, "mTexts", list(texts));
+        field(row, "mIsEnabled", primitive(true)); field(row, "mNumericDecoration", primitive(-1));
+        field(row, "mMetadata", object("androidx.car.app.model.Metadata"));
+        field(row, "mOnClickDelegate", click(callback));
+        return row;
+    }
+
     static Bundle binder(IBinder value) {
         Bundle bundle = new Bundle();
         bundle.putInt("tag_class_type", 9);
@@ -228,12 +240,16 @@ final class CarProtocol {
     }
 
     static Bundle searchTemplate(String query, String hint, IBinder callback) {
+        return searchTemplate(query, hint, callback, Collections.emptyList());
+    }
+
+    static Bundle searchTemplate(String query, String hint, IBinder callback, List<Bundle> rows) {
         Bundle delegate = object("androidx.car.app.model.SearchCallbackDelegateImpl");
         field(delegate, "mStubCallback", interfaceBinder("androidx.car.app.model.ISearchCallback$Stub", callback));
         Bundle back = object("androidx.car.app.model.Action");
         field(back, "mType", primitive(65539));
         Bundle items = object("androidx.car.app.model.ItemList");
-        field(items, "mItems", emptyList());
+        field(items, "mItems", list(rows));
         Bundle search = object("androidx.car.app.model.SearchTemplate");
         field(search, "mInitialSearchText", primitive(query));
         field(search, "mSearchHint", primitive(hint));
